@@ -1,6 +1,6 @@
 # Seizure susceptibility after TBI and cortical spreading depolarizations
 
-Analysis code accompanying Udeozor et al., *Seizure susceptibility following a single acute cluster of cortical spreading depolarizations in a rat model of traumatic brain injury* (Experimental Neurology, uncorrected proof, https://doi.org/10.1016/j.expneurol.2026.116113).
+Analysis code accompanying Udeozor et al., *Seizure susceptibility following a single acute cluster of cortical spreading depolarizations in a rat model of traumatic brain injury* (Experimental Neurology, https://doi.org/10.1016/j.expneurol.2026.116113).
 
 ## Overview
 
