@@ -1,0 +1,135 @@
+# ==============================================================================
+# SCRIPT: Aligned Rank Transform (ART) 2-Way ANOVA with Post-Hoc Contrasts
+# Package: ARTool
+# ==============================================================================
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(ARTool)
+library(emmeans)
+```
+
+```{r}
+file_path <- "eeg_datatable_082126.xlsx"
+raw_data <- read_excel(file_path, na = c("", "NA", "N/A", "n/a", "nan", "NaN"))
+
+data_clean <- raw_data %>%
+  # Filter out true NAs and any literal string matches
+  filter(!is.na(Group) & !str_to_lower(str_trim(Group)) %in% c("", "n/a", "na", "nan")) %>%
+  mutate(
+    Animal = factor(Animal),
+    # Separate 4 groups into 2x2 factorial factors
+    Injury = factor(if_else(str_detect(Group, "TBI"), "TBI", "Sham"), levels = c("Sham", "TBI")),
+    SDs = factor(if_else(str_detect(Group, "\\+SD"), "SD", "Saline"), levels = c("Saline", "SD")),
+    Group = factor(Group, levels = c("Sham", "Sham+SD", "TBI", "TBI+SD"))
+  ) %>%
+  # Drop any leftover unused factor levels
+  droplevels()
+```
+
+
+```{r}
+run_art_analysis_2WAY <- function(data, dv_index, adjust = "fdr") {
+  dv_cols_local <- names(data)
+  dv_name <- dv_cols_local[dv_index]
+  
+  cat("=======================================================\n")
+  cat(sprintf("ANALYSIS FOR: %s (DV Index: %d, Column: %s)\n", 
+              dv_name, dv_index, names(data)[dv_index]))
+  cat("=======================================================\n\n")
+  
+  # Step A: Ensure DV is numeric
+  data_subset <- data
+  data_subset[[dv_name]] <- as.numeric(as.character(data_subset[[dv_name]]))
+  
+  # Step B: Report and drop excluded animals
+  dropped_animals <- data_subset %>%
+    filter(is.na(.data[[dv_name]])) %>%
+    pull(Animal)
+  
+  if (length(dropped_animals) > 0) {
+    cat(sprintf("Dropped %d animal(s) due to NA in %s: %s\n\n", 
+                length(dropped_animals), dv_name, paste(dropped_animals, collapse = ", ")))
+  } else {
+    cat("No animals dropped due to missing values.\n\n")
+  }
+  
+  # Subset clean data with complete values for this DV
+  analysis_df <- data_subset %>% 
+    filter(!is.na(.data[[dv_name]])) %>%
+    droplevels()
+  
+  cat(sprintf("Final sample size for analysis: %d animals\n\n", nrow(analysis_df)))
+  
+  if (nrow(analysis_df) < 4) {
+    cat("Insufficient data points to perform ART ANOVA.\n\n")
+    return(invisible(NULL))
+  }
+  
+  # Step C: Summary of Mean, SD, Median, and IQR per group
+  summary_stats <- analysis_df %>%
+    group_by(Group, Injury, SDs) %>%
+    summarise(
+      N = n(),
+      Mean = mean(.data[[dv_name]], na.rm = TRUE),
+      SD = sd(.data[[dv_name]], na.rm = TRUE),
+      Median = median(.data[[dv_name]], na.rm = TRUE),
+      IQR = IQR(.data[[dv_name]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  cat("--- DESCRIPTIVE SUMMARY TABLE ---\n")
+  print(as.data.frame(summary_stats))
+  cat("\n")
+  
+  # Step D: Fit 2-Way Factorial ART Model (Injury * SDs)
+  cat("--- 2-WAY FACTORIAL ALIGNED RANK TRANSFORM (Injury * SDs) ---\n")
+  # Standardized column reference so ARTool builds model formula cleanly
+  analysis_df$DV_target <- analysis_df[[dv_name]]
+  
+  art_model <- art(DV_target ~ Injury * SDs, data = analysis_df)
+  art_anova <- anova(art_model)
+  print(art_anova)
+  cat("\n")
+  
+  # Step E: Pairwise Group Comparisons with ART & Multiple Testing Adjustment
+  cat(sprintf("--- PAIRWISE GROUP COMPARISONS (%s Adjusted) ---\n", toupper(adjust)))
+  
+  # 1. Full 4-Group interaction pairwise contrasts
+  cat("[1] Group-by-Group Pairwise (Injury:SDs combinations):\n")
+  post_hoc_groups <- art.con(art_model, "Injury:SDs", adjust = adjust)
+  print(summary(post_hoc_groups))
+  cat("\n")
+  
+  # 2. Main Effect Contrasts
+  cat("[2] Main Effect of Injury (Sham vs TBI):\n")
+  post_hoc_injury <- art.con(art_model, "Injury", adjust = adjust)
+  print(summary(post_hoc_injury))
+  cat("\n")
+  
+  cat("[3] Main Effect of SDs (Saline vs SD):\n")
+  post_hoc_sds <- art.con(art_model, "SDs", adjust = adjust)
+  print(summary(post_hoc_sds))
+  cat("\n")
+  
+  return(invisible(list(
+    model = art_model,
+    anova = art_anova,
+    post_hoc_groups = post_hoc_groups,
+    post_hoc_injury = post_hoc_injury,
+    post_hoc_sds = post_hoc_sds,
+    summary = summary_stats,
+    data = analysis_df,
+    dv_name = dv_name
+  )))
+}
+```
+
+```{r}
+results_art <- run_art_analysis_2WAY(
+  data = data_clean, 
+  dv_index = 8,      # Replace with your DV index
+  adjust = "fdr"
+)
+```

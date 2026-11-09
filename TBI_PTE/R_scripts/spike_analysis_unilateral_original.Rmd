@@ -1,0 +1,379 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(purrr)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+```
+
+```{r}
+metadata_file <- "eeg_datatable_082126.xlsx"
+raw_meta <- read_excel(metadata_file, na = c("", "NA", "N/A", "n/a", "nan", "NaN"))
+
+animals_df <- raw_meta %>%
+  filter(!is.na(Group) & !str_to_lower(str_trim(Group)) %in% c("", "n/a", "na", "nan")) %>%
+  mutate(
+    # Clean Animal ID to numeric for consistent matching
+    Animal = as.numeric(as.character(Animal)),
+    # Factorial setup
+    Injury = factor(if_else(str_detect(Group, "TBI"), "TBI", "Sham"), levels = c("Sham", "TBI")),
+    CSDs = factor(if_else(str_detect(Group, "\\+CSD"), "CSD", "Saline"), levels = c("Saline", "CSD")),
+    Group = factor(Group, levels = c("Sham", "Sham+CSD", "TBI", "TBI+CSD"))
+  ) %>%
+  select(Animal, Injury, CSDs, Group) %>%
+  droplevels()
+
+cat(sprintf("Loaded metadata for %d animals across 4 groups.\n", nrow(animals_df)))
+```
+
+```{r}
+spike_folder <- "spike_files_contra"
+
+# List all spike CSV files
+spike_files <- list.files(path = spike_folder, pattern = "\\.csv$", full.names = TRUE)
+
+# Read and compile z_amp data per animal
+spikes_list <- map_dfr(spike_files, function(file) {
+  filename <- basename(file)
+  # Extract first 4 characters and convert to numeric
+  animal_id <- as.numeric(substr(filename, 1, 4))
+  
+  # Read CSV and extract only z_amp
+  df <- read.csv(file)
+  if ("z_amp" %in% names(df)) {
+    data.frame(
+      Animal = animal_id,
+      z_amp = abs(df$z_amp)
+    )
+  } else {
+    NULL
+  }
+})
+
+# Merge with metadata and drop animals without spike data
+final_spikes_df <- animals_df %>%
+  inner_join(spikes_list, by = "Animal") %>%
+  filter(!is.na(z_amp))
+
+cat(sprintf("Loaded %d total spikes across %d unique animals.\n", 
+            nrow(final_spikes_df), n_distinct(final_spikes_df$Animal)))
+```
+
+
+```{r}
+#1-Way LME function: z_amp ~ Group + (1 | Animal) with configurable p-value adjustment
+lme_analysis_1way <- function(data, 
+                                   groups = c("Sham", "Sham+CSD", "TBI", "TBI+CSD"),
+                                   adjust = c("fdr", "none", "tukey", "bonferroni", "holm")) {
+  
+  adjust <- match.arg(adjust)
+  
+  # Step A: Filter by selected groups and format variables
+  analysis_df <- data %>%
+    filter(Group %in% groups) %>%
+    mutate(
+      Animal = factor(Animal),
+      Group = factor(Group, levels = groups),
+      z_amp = as.numeric(z_amp)
+    ) %>%
+    filter(!is.na(z_amp) & !is.na(Animal)) %>%
+    droplevels()
+  
+  cat("=======================================================\n")
+  cat("1-WAY LINEAR MIXED-EFFECTS MODEL FOR SPIKE |Z-AMPLITUDE|\n")
+  cat("Model Formula: z_amp ~ Group + (1 | Animal)\n")
+  cat(sprintf("Groups Included: %s\n", paste(levels(analysis_df$Group), collapse = ", ")))
+  cat(sprintf("Multiple Testing Adjustment: %s\n", toupper(adjust)))
+  cat(sprintf("Total Spikes: %d | Total Animals: %d\n", nrow(analysis_df), n_distinct(analysis_df$Animal)))
+  cat("=======================================================\n\n")
+  
+  if (n_distinct(analysis_df$Group) < 2) {
+    cat("Error: At least 2 groups are required to fit the model.\n\n")
+    return(invisible(NULL))
+  }
+  
+  # Step B: Fit 1-Way LME with random subject intercepts
+  lme_model <- lmer(z_amp ~ Group + (1 | Animal), data = analysis_df)
+  
+  # Step C: ANOVA summary (Type III Satterthwaite)
+  cat("--- TYPE III ANOVA TABLE (Group Effect) ---\n")
+  print(anova(lme_model, type = 3))
+  cat("\n")
+  
+  # Step D: Model parameters
+  cat("--- MODEL COEFFICIENTS & VARIANCE COMPONENTS ---\n")
+  print(summary(lme_model))
+  cat("\n")
+  
+  # Step E: Pairwise Group comparisons with chosen adjustment
+  cat(sprintf("--- ESTIMATED MARGINAL MEANS & POST-HOC PAIRWISE (%s) ---\n", toupper(adjust)))
+  emm <- emmeans(lme_model, ~ Group)
+  post_hoc <- pairs(emm, adjust = adjust)
+  
+  print(summary(emm))
+  cat("\n")
+  print(summary(post_hoc))
+  cat("\n")
+  
+  return(invisible(list(
+    model = lme_model,
+    emm = emm,
+    post_hoc = post_hoc,
+    data = analysis_df
+  )))
+}
+```
+
+```{r}
+# Spike distribution plot supporting metric choice ("median" or "mean") and group subsetting
+plot_spike_distribution <- function(data, 
+                                    groups = c("Sham", "Sham+CSD", "TBI", "TBI+CSD"),
+                                    metric = c("median", "mean"),
+                                    binwidth = 0.5,
+                                    colors = c("Sham" = "#0099FF", 
+                                               "Sham+CSD" = "#005698", 
+                                               "TBI" = "#FF7474", 
+                                               "TBI+CSD" = "#A20000"),
+                                    title = "Ictal Spike Amplitude Distribution",
+                                    xlab = "Z-Scored Amplitude",
+                                    ylab = "TIE Count") {
+  
+  metric <- match.arg(metric)
+  
+  # Filter data by specified groups
+  plot_data <- data %>%
+    filter(Group %in% groups) %>%
+    mutate(Group = factor(Group, levels = groups)) %>%
+    droplevels()
+  
+  if (nrow(plot_data) == 0) {
+    warning("No data points found for the specified groups.")
+    return(invisible(NULL))
+  }
+  
+  # Compute counts and selected metric value per group
+  group_summaries <- plot_data %>%
+    group_by(Group) %>%
+    summarise(
+      n_spikes = n(),
+      n_animals = n_distinct(Animal),
+      stat_val = if (metric == "median") median(z_amp, na.rm = TRUE) else mean(z_amp, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      panel_label = sprintf("%s (n = %d TIEs, N = %d animals)", Group, n_spikes, n_animals),
+      stat_label = sprintf("%s: %.2f", tools::toTitleCase(metric), stat_val)
+    )
+  
+  # Attach panel labels and preserve factor ordering
+  plot_data <- plot_data %>%
+    left_join(group_summaries %>% select(Group, panel_label), by = "Group") %>%
+    mutate(panel_label = factor(panel_label, levels = group_summaries$panel_label))
+  
+  group_summaries <- group_summaries %>%
+    mutate(panel_label = factor(panel_label, levels = levels(plot_data$panel_label)))
+  
+  # Build plot
+  p <- ggplot(plot_data, aes(x = z_amp, fill = Group)) +
+    geom_histogram(binwidth = binwidth, color = "black", alpha = 0.85) +
+    # Vertical line at the selected metric value
+    geom_vline(data = group_summaries, aes(xintercept = stat_val),
+               color = "black", linetype = "dashed", linewidth = 0.8) +
+    # Text annotation for the selected metric
+    geom_text(data = group_summaries, 
+              aes(x = Inf, y = Inf, label = stat_label),
+              hjust = 1.1, vjust = 1.6, inherit.aes = FALSE,
+              size = 3.6, fontface = "bold") +
+    facet_wrap(~ panel_label, ncol = 1, scales = "free_y") +
+    scale_fill_manual(values = colors) +
+    theme_classic(base_size = 12) +
+    labs(
+      title = title,
+      x = xlab,
+      y = ylab
+    ) +
+    theme(
+      legend.position = "none",
+      strip.text = element_text(face = "bold", size = 11),
+      strip.background = element_rect(fill = "#f0f0f0", color = "gray60"),
+      panel.spacing = unit(1.2, "lines"),
+      plot.title = element_text(face = "bold", size = 14)
+    )
+  
+  print(p)
+  return(invisible(p))
+}
+```
+
+
+```{r}
+# Assumption Diagnostics Function for LME models
+check_lme_normality <- function(lme_result) {
+  # 1. Extract model from list output
+  model <- if (is.list(lme_result) && "model" %in% names(lme_result)) {
+    lme_result$model
+  } else {
+    lme_result
+  }
+  
+  # 2. Extract residuals, fitted values, and random intercepts
+  resids <- residuals(model)
+  fitted_vals <- fitted(model)
+  rand_effs <- unlist(ranef(model)$Animal)
+  
+  # 3. Perform Shapiro-Wilk test on random intercepts (per-animal level)
+  sw_animal <- shapiro.test(rand_effs)
+  
+  cat("=======================================================\n")
+  cat("LINEAR MIXED-EFFECTS MODEL ASSUMPTION DIAGNOSTICS\n")
+  cat("=======================================================\n")
+  cat(sprintf("Number of Residuals (Spikes): %d\n", length(resids)))
+  cat(sprintf("Number of Random Intercepts (Animals): %d\n", length(rand_effs)))
+  cat(sprintf("Shapiro-Wilk Test (Animal Intercepts): W = %.4f, p = %.4f\n", 
+              sw_animal$statistic, sw_animal$p.value))
+  if (sw_animal$p.value >= 0.05) {
+    cat("-> Animal-level random effects meet the normality assumption (p >= 0.05).\n")
+  } else {
+    cat("-> Animal-level random effects deviate from normality (p < 0.05).\n")
+  }
+  cat("=======================================================\n\n")
+  
+  # 4. Generate 2x2 Diagnostic Plot Grid
+  old_par <- par(mfrow = c(2, 2), mar = c(4.5, 4.5, 3, 1))
+  on.exit(par(old_par))
+  
+  # Plot 1: Q-Q Plot of Model Residuals
+  qqnorm(resids, main = "Q-Q: Within-Animal Residuals", 
+         pch = 20, col = rgb(0, 0, 0, 0.3))
+  qqline(resids, col = "#c0392b", lwd = 2)
+  
+  # Plot 2: Q-Q Plot of Animal Random Effects
+  qqnorm(rand_effs, main = "Q-Q: Animal Random Intercepts", 
+         pch = 19, col = "#2b5c8f")
+  qqline(rand_effs, col = "#c0392b", lwd = 2)
+  
+  # Plot 3: Residuals vs Fitted (Homoscedasticity check)
+  plot(fitted_vals, resids, 
+       main = "Residuals vs. Fitted", 
+       xlab = "Fitted Values", 
+       ylab = "Residuals",
+       pch = 20, col = rgb(0, 0, 0, 0.3))
+  abline(h = 0, col = "#c0392b", lty = 2, lwd = 1.5)
+  
+  # Plot 4: Distribution of Residuals (Histogram)
+  hist(resids, breaks = 30, col = "#d9d9d9", border = "black",
+       main = "Residual Distribution", xlab = "Residuals", freq = FALSE)
+  curve(dnorm(x, mean = mean(resids), sd = sd(resids)), 
+        add = TRUE, col = "#c0392b", lwd = 2)
+}
+```
+
+```{r}
+# Prism-style Summary Box Plot Function (Median/IQR + Whiskers across spikes per group)
+plot_spike_summary_box <- function(data, 
+                                   groups = c("Sham", "TBI", "TBI+CSD"),
+                                   colors = c("Sham" = "#0099FF", 
+                                              "Sham+CSD" = "#005698", 
+                                              "TBI" = "#FF7474", 
+                                              "TBI+CSD" = "#A20000"),
+                                   title = NULL,
+                                   xlab = "",
+                                   ylab = "Normalized Amplitude",
+                                   box_width = 0.55,
+                                   aspect_ratio = 1.6,
+                                   outliers = FALSE) {
+  
+  # Step A: Filter by passed groups and ensure correct factor levels
+  plot_data <- data %>%
+    filter(Group %in% groups) %>%
+    mutate(Group = factor(Group, levels = groups)) %>%
+    filter(!is.na(z_amp)) %>%
+    droplevels()
+  
+  if (nrow(plot_data) == 0) {
+    warning("No data points found for the specified groups.")
+    return(invisible(NULL))
+  }
+  
+  # Step B: Build the compact Prism-style box plot
+  p <- ggplot(plot_data, aes(x = Group, y = z_amp, fill = Group)) +
+    # Crossbar error whiskers (Tukey style)
+    stat_boxplot(geom = "errorbar", width = 0.25, linewidth = 1.0, color = "black") +
+    # Main box body with bold outline and outlier toggle
+    geom_boxplot(
+      width = box_width, 
+      color = "black", 
+      linewidth = 1.1, 
+      alpha = 0.9,
+      outlier.shape = if (outliers) 16 else NA,
+      outlier.size = if (outliers) 1.5 else NA,
+      outlier.alpha = if (outliers) 0.5 else NA
+    ) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.1))) +
+    scale_fill_manual(values = colors) +
+    theme_classic(base_size = 14) +
+    labs(
+      title = title,
+      x = xlab,
+      y = ylab
+    ) +
+    theme(
+      # Forces a tall, narrow aspect ratio so boxes stay close together
+      aspect.ratio = aspect_ratio,
+      legend.position = "none",
+      plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+      axis.title.y = element_text(face = "bold", size = 13),
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(face = "bold", size = 12, angle = 45, hjust = 1, vjust = 1, color = "black"),
+      axis.text.y = element_text(face = "bold", size = 12, color = "black"),
+      axis.line = element_line(color = "black", linewidth = 1.0),
+      axis.ticks = element_line(color = "black", linewidth = 1.0),
+      axis.ticks.length = unit(0.18, "cm")
+    )
+  
+  print(p)
+  return(invisible(p))
+}
+```
+
+
+```{r}
+target_groups <- c("Sham", "Sham+CSD", "TBI", "TBI+CSD")
+#target_groups <- c("Sham", "TBI", "TBI+CSD")
+
+# Plot only target groups
+p = plot_spike_distribution(final_spikes_df, groups = target_groups, metric = "median", xlab = "Nornamized Amplitude")
+# ggsave("ShamCSDTIEdistributionContralateral.svg", plot = p, width = 6, height = 4)
+
+```
+
+```{r}
+# Run 1-way LME only on target groups
+lme_subset <- lme_analysis_1way(final_spikes_df, groups = target_groups, adjust = 'fdr')
+```
+
+```{r}
+# Example 1: Mean + SEM across all 4 groups
+p = plot_spike_summary_box(
+  data = final_spikes_df,
+  groups = target_groups,
+  title = NULL,
+  xlab = "",
+  ylab = "Normalized Amplitude",
+  aspect_ratio = 1.8
+  )
+p
+# ggsave("SpikeBoxPlotContralatera.svg", plot = p, width = 6, height = 4)
+```
+
+```{r}
+check_lme_normality(lme_subset)
+```
